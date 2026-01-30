@@ -17,6 +17,10 @@ from sglang.srt.layers.attention.fla.fused_recurrent import (
 from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
+from sglang.jit_kernel.cutedsl_gdn_transpose import (
+    cutedsl_fused_recurrent_gated_delta_rule_update, 
+    cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update
+)
 from sglang.srt.layers.attention.fla.kda import chunk_kda
 from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
     PAD_SLOT_ID,
@@ -795,12 +799,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         use_cutedsl = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE.get()
-        rank0_log(f"CuTe DSL GDN decode enabled: {use_cutedsl}")
-        self._kernel_func = (
-            cutedsl_fused_sigmoid_gating_delta_rule_update
-            if use_cutedsl
-            else fused_sigmoid_gating_delta_rule_update
-        )
+        self.use_cutedsl_transpose = Envs.SGLANG_USE_CUTEDSL_GDN_DECODE_TRANSPOSE.get()
+        rank0_log(f"CuTe DSL GDN decode enabled: use_cutedsl: {use_cutedsl}, use_cutedsl_transpose: {self.use_cutedsl_transpose}")
+        if use_cutedsl:
+            self._decode_kernel_func = cutedsl_fused_sigmoid_gating_delta_rule_update
+            self._verify_kernel_func = fused_recurrent_gated_delta_rule_update
+        elif self.use_cutedsl_transpose:
+            self._decode_kernel_func = cutedsl_fused_recurrent_sigmoid_gated_delta_rule_update
+            self._verify_kernel_func = cutedsl_fused_recurrent_gated_delta_rule_update
+        else:
+            self._decode_kernel_func = fused_sigmoid_gating_delta_rule_update
+            self._verify_kernel_func = fused_recurrent_gated_delta_rule_update
 
     def forward_decode(
         self,
@@ -838,7 +847,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
         value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
 
-        core_attn_out = self._kernel_func(
+        core_attn_out = self._decode_kernel_func(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             q=query,
@@ -963,7 +972,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
         if is_target_verify:
-            core_attn_out = fused_recurrent_gated_delta_rule_update(
+            core_attn_out = self._verify_kernel_func(
                 q=query,
                 k=key,
                 v=value,
@@ -981,7 +990,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             # Only cuda env uses fuse ssm_states update
-            recurrent_state = ssm_states
+            # -> V contiguous
+            if self.use_cutedsl_transpose:
+                recurrent_state = ssm_states.transpose(-2, -1)
+            else:
+                recurrent_state = ssm_states
             recurrent_state_indices_args = {"initial_state_indices": cache_indices}
             if is_npu():
                 recurrent_state = ssm_states[cache_indices]
@@ -996,6 +1009,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cu_seqlens=query_start_loc,
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
+                transpose_state=True if self.use_cutedsl_transpose else False,
                 **recurrent_state_indices_args,
             )
             if is_npu():
