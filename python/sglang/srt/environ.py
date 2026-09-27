@@ -1154,6 +1154,9 @@ class Envs:
     SGLANG_ENABLE_BF16_SPLITK_GEMM = EnvBool(True)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
+    # Fuse compact-layout routing, FP8 group quantization, and route scatter
+    # for eager DeepGEMM prefill. CUDA graph capture keeps the baseline path.
+    SGLANG_DEEPGEMM_PREFILL_OPT = EnvBool(False)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
     # round_up(max(masked_m), 256) instead of round_up(rank_tokens, 256):
     # shrinks the [num_local_experts, m, *] MoE intermediates ~4x under

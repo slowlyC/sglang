@@ -259,6 +259,30 @@ def _get_compact_all_tokens(
     )
 
 
+def _should_use_fused_fp8_contiguous_preprocess(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_info: DeepGemmMoeQuantInfo,
+) -> bool:
+    block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+    return (
+        envs.SGLANG_DEEPGEMM_PREFILL_OPT.get()
+        and _is_cuda
+        and not get_flags().capture.disable_dispose_tensor
+        and quant_info.use_fp8
+        and not quant_info.is_fp4_experts
+        and not quant_info.use_mxfp8
+        and quant_info.w13_weight.dtype == torch.float8_e4m3fn
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.ndim == 2
+        and hidden_states.is_contiguous()
+        and hidden_states.shape[1] % 128 == 0
+        and topk_ids.dtype == torch.int32
+        and topk_ids.is_contiguous()
+        and block_k == 128
+    )
+
+
 @dataclass
 class DeepGemmRunnerInput(RunnerInput):
     hidden_states: torch.Tensor
@@ -1068,6 +1092,54 @@ def pre_permute_standard_to_deep_gemm(
     )
     all_tokens = _get_compact_all_tokens(num_assignments, num_experts, block_e)
 
+    k = hidden_states.size(1)
+    output_dtype = (
+        torch.bfloat16
+        if quant_info.w13_weight.dtype == torch.bfloat16
+        else torch.float8_e4m3fn
+    )
+    block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
+
+    if _should_use_fused_fp8_contiguous_preprocess(hidden_states, topk_ids, quant_info):
+        from sglang.kernels.ops.moe.deepgemm_contiguous_preprocess import (
+            moe_tp_deepgemm_preprocess,
+        )
+
+        packed_input, packed_input_scale, m_indices, src2dst = (
+            moe_tp_deepgemm_preprocess(
+                topk_ids,
+                num_experts,
+                hidden_states,
+                runner_config.top_k,
+                quant_info.block_shape,
+                expert_alignment=block_e,
+                all_tokens=all_tokens,
+                expert_start=expert_start,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            )
+        )
+
+        if runner_config.inplace:
+            dispose_tensor(hidden_states_ref)
+
+        running_state["topk_ids"] = topk_ids
+        running_state["topk_weights"] = topk_weights
+        running_state["hidden_states_shape"] = hidden_states_shape
+        running_state["hidden_states_dtype"] = hidden_states_dtype
+        running_state["hidden_states_device"] = hidden_states_device
+        running_state["src2dst"] = src2dst
+        running_state["all_tokens"] = all_tokens
+        running_state["contiguous_layout_alignment"] = block_e
+
+        return DeepGemmRunnerInput(
+            hidden_states=packed_input,
+            hidden_states_scale=packed_input_scale,
+            use_masked_gemm=False,
+            m_indices=m_indices,
+            hidden_states_scale_tma_aligned=True,
+            activation_scale_block_size=block_k,
+        )
+
     tokens_per_expert, unused_masked_dst = fused_moe_dispatch_index(
         topk_ids, num_experts, 1, expert_start=expert_start
     )
@@ -1083,12 +1155,6 @@ def pre_permute_standard_to_deep_gemm(
         )
         tokens_per_expert[-1].add_(all_tokens - tokens_per_expert.sum())
 
-    k = hidden_states.size(1)
-    output_dtype = (
-        torch.bfloat16
-        if quant_info.w13_weight.dtype == torch.bfloat16
-        else torch.float8_e4m3fn
-    )
     if output_dtype == torch.bfloat16:
         packed_input_source = hidden_states
         packed_input_source_scale = None
@@ -1105,7 +1171,6 @@ def pre_permute_standard_to_deep_gemm(
             sglang_per_token_group_quant_fp8,
         )
 
-        block_k = quant_info.block_shape[1] if quant_info.block_shape else 128
         packed_input_source, packed_input_source_scale = (
             sglang_per_token_group_quant_fp8(
                 hidden_states,

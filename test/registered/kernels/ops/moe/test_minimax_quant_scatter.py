@@ -299,6 +299,15 @@ def test_standard_masked_runner_matches_compact_end_to_end(
             deterministic=SimpleNamespace(enable_deterministic_inference=False)
         ),
     )
+    import sglang.kernels.ops.moe.deepgemm_contiguous_preprocess as preprocess
+
+    # The direct kernel test covers CuTe DSL. Keep this integration test on the
+    # Triton fallback so it isolates runner wiring from CuTe DSL compilation.
+    monkeypatch.setattr(
+        preprocess,
+        "_should_use_cutedsl",
+        lambda _all_tokens, _hidden_size: False,
+    )
 
     # UE8M0 packs four 128-wide scale groups into each int32. Use the smallest
     # legal K for both the gate/up and down GEMMs.
@@ -377,7 +386,7 @@ def test_standard_masked_runner_matches_compact_end_to_end(
         topk_output=(topk_weights, topk_ids, None),
     )
 
-    def run_with_layout(layout):
+    def run_with_layout(layout, fused_preprocess=False):
         config = MoeRunnerConfig(
             num_experts=8,
             num_local_experts=num_local_experts,
@@ -389,12 +398,12 @@ def test_standard_masked_runner_matches_compact_end_to_end(
             inplace=False,
         )
         running_state = {}
-        with envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override(layout):
+        with (
+            envs.SGLANG_DEEPGEMM_STANDARD_LAYOUT.override(layout),
+            envs.SGLANG_DEEPGEMM_PREFILL_OPT.override(fused_preprocess),
+        ):
             runner_input = pre_permute_standard_to_deep_gemm(
-                dispatch_output,
-                quant_info,
-                config,
-                running_state,
+                dispatch_output, quant_info, config, running_state
             )
         runner_output = DeepGemmRunnerCore(config).run(
             runner_input,
@@ -403,6 +412,7 @@ def test_standard_masked_runner_matches_compact_end_to_end(
         )
         return (
             runner_input.use_masked_gemm,
+            runner_input.hidden_states_scale_tma_aligned,
             running_state.get("all_tokens"),
             runner_input.m_indices,
             post_permute_deep_gemm_to_standard(
@@ -415,12 +425,21 @@ def test_standard_masked_runner_matches_compact_end_to_end(
 
     (
         compact_is_masked,
+        compact_scale_aligned,
         compact_all_tokens,
         compact_m_indices,
         compact_output,
     ) = run_with_layout("compact")
     (
+        fused_is_masked,
+        fused_scale_aligned,
+        fused_all_tokens,
+        fused_m_indices,
+        fused_output,
+    ) = run_with_layout("compact", fused_preprocess=True)
+    (
         masked_is_masked,
+        masked_scale_aligned,
         masked_all_tokens,
         masked_m_indices,
         masked_output,
@@ -428,8 +447,13 @@ def test_standard_masked_runner_matches_compact_end_to_end(
     torch.cuda.synchronize()
 
     assert not compact_is_masked
+    assert not compact_scale_aligned
+    assert not fused_is_masked
+    assert fused_scale_aligned is (weight_dtype == "fp8")
     assert masked_is_masked
+    assert not masked_scale_aligned
     assert compact_all_tokens == 64
+    assert fused_all_tokens == compact_all_tokens
     assert masked_all_tokens is None
     assert masked_m_indices is None
     valid_assignments = topk_ids[topk_ids >= 0]
@@ -443,8 +467,21 @@ def test_standard_masked_runner_matches_compact_end_to_end(
     assert (compact_m_indices == -1).sum() == compact_all_tokens - len(
         valid_assignments
     )
+    assert torch.equal(
+        torch.bincount(
+            fused_m_indices[fused_m_indices >= 0],
+            minlength=num_local_experts,
+        ),
+        torch.bincount(valid_assignments, minlength=num_local_experts),
+    )
     torch.testing.assert_close(
         masked_output,
+        compact_output,
+        rtol=5e-2,
+        atol=5e-2,
+    )
+    torch.testing.assert_close(
+        fused_output,
         compact_output,
         rtol=5e-2,
         atol=5e-2,
